@@ -499,7 +499,11 @@ impl CheckBytesEntry {
     }
 }
 
-inventory::collect!(CheckBytesEntry);
+/// Builds a [`CheckBytesEntry`] when the registry is first read; see [`crate::ImplEntryFn`].
+#[doc(hidden)]
+pub struct CheckBytesEntryFn(pub fn() -> CheckBytesEntry);
+
+inventory::collect!(CheckBytesEntryFn);
 
 #[doc(hidden)]
 pub struct CheckBytesRegistry {
@@ -531,8 +535,8 @@ lazy_static::lazy_static! {
     #[doc(hidden)]
     pub static ref CHECK_BYTES_REGISTRY: CheckBytesRegistry =  {
         let mut result = CheckBytesRegistry::new();
-        for entry in inventory::iter::<CheckBytesEntry> {
-            result.add_entry(entry);
+        for entry_fn in inventory::iter::<CheckBytesEntryFn> {
+            result.add_entry(&(entry_fn.0)());
         }
         result
     };
@@ -542,8 +546,14 @@ lazy_static::lazy_static! {
 #[macro_export]
 macro_rules! register_validation {
     ($type:ty as $trait:ty) => {
-        use rkyv_dyn::validation::{CheckBytesEntry, IsCheckBytesDyn, NotCheckBytesDyn};
+        use rkyv_dyn::validation::{
+            CheckBytesEntry, CheckBytesEntryFn, IsCheckBytesDyn, NotCheckBytesDyn,
+        };
 
-        inventory::submit! { CheckBytesEntry::new::<$type, $trait>(IsCheckBytesDyn::<$type>::CHECK_BYTES_DYN) }
-    }
+        inventory::submit! {
+            CheckBytesEntryFn(|| {
+                CheckBytesEntry::new::<$type, $trait>(IsCheckBytesDyn::<$type>::CHECK_BYTES_DYN)
+            })
+        }
+    };
 }

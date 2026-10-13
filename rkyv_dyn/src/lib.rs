@@ -454,7 +454,14 @@ impl ImplEntry {
     }
 }
 
-inventory::collect!(ImplEntry);
+/// Builds an [`ImplEntry`] when the registry is first read.
+///
+/// `inventory::submit!` places its value in a `static`, so the value must be const.
+/// [`ImplEntry::new`] is not, so the entry is submitted as a function that builds it.
+#[doc(hidden)]
+pub struct ImplEntryFn(pub fn() -> ImplEntry);
+
+inventory::collect!(ImplEntryFn);
 
 struct ImplRegistry {
     id_to_data: HashMap<ImplId, ImplData>,
@@ -497,8 +504,8 @@ impl ImplRegistry {
 lazy_static::lazy_static! {
     static ref IMPL_REGISTRY: ImplRegistry = {
         let mut result = ImplRegistry::new();
-        for entry in inventory::iter::<ImplEntry> {
-            result.add_entry(entry);
+        for entry_fn in inventory::iter::<ImplEntryFn> {
+            result.add_entry(&(entry_fn.0)());
         }
         result
     };
@@ -531,7 +538,7 @@ macro_rules! register_impl {
         const _: () = {
             use rkyv_dyn::{
                 debug_info, inventory, register_validation, ImplData, ImplDebugInfo, ImplEntry,
-                RegisteredImpl,
+                ImplEntryFn, RegisteredImpl,
             };
 
             unsafe impl RegisteredImpl<$trait> for $type {
@@ -548,7 +555,7 @@ macro_rules! register_impl {
                 }
             }
 
-            inventory::submit! { ImplEntry::new::<$type, $trait>() }
+            inventory::submit! { ImplEntryFn(|| ImplEntry::new::<$type, $trait>()) }
             register_validation!($type as $trait);
         };
     };

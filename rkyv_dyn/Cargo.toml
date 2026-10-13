@@ -14,7 +14,7 @@ repository.workspace = true
 
 [dependencies]
 bytecheck = { workspace = true, optional = true }
-inventory = "0.1"
+inventory = "0.3.25"
 lazy_static = "1.4"
 ptr_meta.workspace = true
 rkyv = { version = "0.7.46", path = "../rkyv", default-features = false }
