@@ -1,11 +1,11 @@
-# rkyv_dyn &emsp; [![Latest Version]][crates.io] [![License]][license path] [![requires: rustc 1.54+]][Rust 1.54]
+# rkyv_dyn &emsp; [![Latest Version]][crates.io] [![License]][license path] [![requires: rustc 1.81+]][Rust 1.81]
 
 [Latest Version]: https://img.shields.io/crates/v/rkyv_dyn.svg
 [crates.io]: https://crates.io/crates/rkyv_dyn
 [License]: https://img.shields.io/badge/license-MIT-blue.svg
 [license path]: https://github.com/rkyv/rkyv/blob/master/LICENSE
-[requires: rustc 1.54+]: https://img.shields.io/badge/rustc-1.54+-lightgray.svg
-[Rust 1.54]: https://blog.rust-lang.org/2021/07/29/Rust-1.54.0.html 
+[requires: rustc 1.81+]: https://img.shields.io/badge/rustc-1.81+-lightgray.svg
+[Rust 1.81]: https://blog.rust-lang.org/2024/09/05/Rust-1.81.0.html 
 
 Trait object serialization for rkyv.
 
@@ -38,75 +38,46 @@ Trait object serialization for rkyv.
 # Example
 
 ```rust
-use rkyv::{
-    archived_value,
-    ser::{
-        serializers::AllocSerializer,
-        Serializer,
-    },
-    Archive,
-    Archived,
-    Deserialize,
-    Infallible,
-    Serialize,
-};
-use rkyv_dyn::archive_dyn;
+use rkyv::{rancor::Error, Archive, Archived, Deserialize, Serialize};
+use rkyv_dyn::{archive_dyn, register_trait_impls};
 
 #[archive_dyn(deserialize)]
-trait ExampleTrait {
-    fn value(&self) -> String;
+trait Shape {
+    fn area(&self) -> f32;
 }
 
 #[derive(Archive, Serialize, Deserialize)]
-struct StringStruct(String);
+struct Square(f32);
 
 #[archive_dyn(deserialize)]
-impl ExampleTrait for StringStruct {
-    fn value(&self) -> String {
-        self.0.clone()
+impl Shape for Square {
+    fn area(&self) -> f32 {
+        self.0 * self.0
     }
 }
 
-impl ExampleTrait for ArchivedStringStruct {
-    fn value(&self) -> String {
-        self.0.as_str().to_string()
+impl Shape for ArchivedSquare {
+    fn area(&self) -> f32 {
+        self.0.to_native() * self.0.to_native()
     }
 }
 
-#[derive(Archive, Serialize, Deserialize)]
-struct IntStruct(i32);
+type BoxedShape = Box<dyn SerializeShape<Error, Error>>;
 
-#[archive_dyn(deserialize)]
-impl ExampleTrait for IntStruct {
-    fn value(&self) -> String {
-        format!("{}", self.0)
-    }
-}
-
-impl ExampleTrait for ArchivedIntStruct {
-    fn value(&self) -> String {
-        format!("{}", self.0)
-    }
-}
-
-#[test]
 fn main() {
-    let boxed_int = Box::new(IntStruct(42)) as Box<dyn SerializeExampleTrait>;
-    let boxed_string = Box::new(StringStruct("hello world".to_string())) as Box<dyn SerializeExampleTrait>;
-    let mut serializer = AllocSerializer::<256>::default();
+    // Register every archived type with the archived trait it implements,
+    // once, before serializing or accessing trait objects.
+    register_trait_impls! {
+        Archived<Square> as dyn DeserializeShape<Error, Error> = 0,
+    }
 
-    let int_pos = serializer.serialize_value(&boxed_int).unwrap();
-    let string_pos = serializer.serialize_value(&boxed_string).unwrap();
-    let buf = serializer.into_serializer().into_inner();
+    let value: BoxedShape = Box::new(Square(2.0));
+    let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
 
-    let archived_int = unsafe { archived_value::<Box<dyn SerializeExampleTrait>>(buf.as_ref(), int_pos) };
-    let archived_string = unsafe { archived_value::<Box<dyn SerializeExampleTrait>>(buf.as_ref(), string_pos) };
-    assert_eq!(archived_int.value(), "42");
-    assert_eq!(archived_string.value(), "hello world");
+    let archived = rkyv::access::<Archived<BoxedShape>, Error>(&bytes).unwrap();
+    assert_eq!(archived.area(), 4.0);
 
-    let deserialized_int: Box<dyn SerializeExampleTrait> = archived_int.deserialize(&mut Infallible).unwrap();
-    let deserialized_string: Box<dyn SerializeExampleTrait> = archived_string.deserialize(&mut Infallible).unwrap();
-    assert_eq!(deserialized_int.value(), "42");
-    assert_eq!(deserialized_string.value(), "hello world");
+    let deserialized = rkyv::deserialize::<BoxedShape, Error>(archived).unwrap();
+    assert_eq!(deserialized.area(), 4.0);
 }
 ```

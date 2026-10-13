@@ -15,7 +15,6 @@ repository.workspace = true
 
 [dependencies]
 bytecheck = { workspace = true, optional = true }
-lazy_static = "1.4"
 ptr_meta.workspace = true
 rancor.workspace = true
 rkyv.workspace = true
@@ -23,7 +22,7 @@ rkyv_dyn_derive.workspace = true
 
 [features]
 default = ["std", "bytecheck"]
-std = ["bytecheck?/std"]
+std = ["rkyv/std"]
 bytecheck = ["dep:bytecheck", "rkyv/bytecheck", "rkyv_dyn_derive/bytecheck"]
 
 [package.metadata.docs.rs]

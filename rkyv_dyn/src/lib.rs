@@ -3,7 +3,74 @@
 //! With `rkyv_dyn`, trait objects can be serialized with rkyv then the methods
 //! can be called without deserializing. All it takes is some macro magic.
 //!
-//! See [`SerializeDyn`] for an example of how to use rkyv_dyn.
+//! # Usage
+//!
+//! 1. Add [`archive_dyn`](macro@archive_dyn) to your trait. This generates a
+//!    serializable version of the trait (by default named "Serialize" + your
+//!    trait name) and an archived version of it (by default named "Archived" +
+//!    your trait name, or "Deserialize" + your trait name with `deserialize`).
+//! 2. Implement your trait for your type and for its archived type. If you
+//!    passed `deserialize` to the trait, add `#[archive_dyn(deserialize)]` to
+//!    the impl for your type too.
+//! 3. Call [`register_trait_impls!`] once in your program, before serializing
+//!    or accessing any trait objects, and list every archived type with the
+//!    archived trait it implements.
+//!
+//! Every archived trait object stores the impl ID of its type. Impl IDs are
+//! assigned in the order the impls are listed in [`register_trait_impls!`],
+//! so reordering the list changes them and breaks existing archives. Give each
+//! impl an explicit ID with `= id` if archives need to outlive the program
+//! that wrote them.
+//!
+//! # Example
+//!
+//! ```
+//! use rkyv::{rancor::Error, Archive, Archived, Deserialize, Serialize};
+//! use rkyv_dyn::{archive_dyn, register_trait_impls};
+//!
+//! #[archive_dyn(deserialize)]
+//! trait Shape {
+//!     fn area(&self) -> f32;
+//! }
+//!
+//! #[derive(Archive, Serialize, Deserialize)]
+//! struct Square(f32);
+//!
+//! #[archive_dyn(deserialize)]
+//! impl Shape for Square {
+//!     fn area(&self) -> f32 {
+//!         self.0 * self.0
+//!     }
+//! }
+//!
+//! impl Shape for ArchivedSquare {
+//!     fn area(&self) -> f32 {
+//!         self.0.to_native() * self.0.to_native()
+//!     }
+//! }
+//!
+//! type BoxedShape = Box<dyn SerializeShape<Error, Error>>;
+//!
+//! # #[cfg(feature = "bytecheck")]
+//! fn main() {
+//!     register_trait_impls! {
+//!         Archived<Square> as dyn DeserializeShape<Error, Error> = 0,
+//!     }
+//!
+//!     let value: BoxedShape = Box::new(Square(2.0));
+//!     let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
+//!
+//!     let archived =
+//!         rkyv::access::<Archived<BoxedShape>, Error>(&bytes).unwrap();
+//!     assert_eq!(archived.area(), 4.0);
+//!
+//!     let deserialized =
+//!         rkyv::deserialize::<BoxedShape, Error>(archived).unwrap();
+//!     assert_eq!(deserialized.area(), 4.0);
+//! }
+//! # #[cfg(not(feature = "bytecheck"))]
+//! # fn main() {}
+//! ```
 //!
 //! ## Features
 //!
@@ -14,20 +81,19 @@
 #![deny(rustdoc::missing_crate_level_docs)]
 
 mod lazy_static;
-// TODO: re-enable
-// #[cfg(feature = "bytecheck")]
-// mod bytecheck;
+#[cfg(feature = "bytecheck")]
+pub mod validation;
 
-use core::{hash, marker::PhantomData};
+use core::{any::TypeId, hash, marker::PhantomData};
 
 pub use lazy_static::LazyStatic;
 use ptr_meta::{DynMetadata, Pointee};
 use rancor::Fallible;
 use rkyv::{
     de::Pooling,
-    place::Initialized,
     primitive::FixedUsize,
     ser::{Allocator, Sharing, Writer},
+    traits::NoUndef,
     Archived, Portable, Serialize, SerializeUnsized,
 };
 pub use rkyv_dyn_derive::archive_dyn;
@@ -48,9 +114,9 @@ impl<E> Fallible for dyn DynSerializer<E> + '_ {
 
 impl<S: Writer<E> + Allocator<E> + Sharing<E>, E> DynSerializer<E> for S {}
 
-/// TODO
+/// Converts a serializer into a [`DynSerializer`].
 pub trait AsDynSerializer<E> {
-    /// TODO
+    /// Returns this serializer as a [`DynSerializer`] trait object.
     fn as_dyn_serializer(&mut self) -> &mut dyn DynSerializer<E>;
 }
 
@@ -68,103 +134,10 @@ impl<E> AsDynSerializer<E> for dyn DynSerializer<E> {
 
 /// A trait object that can be archived.
 ///
-/// To add archive support for a trait object:
-///
-/// 1. Add [`archive_dyn`](macro@archive_dyn) on your trait to make a
-///    serializable version of it. By default, it will be named "Serialize" +
-///    your trait name. To rename the trait, pass the argument `serialize =
-///    "..."` as a parameter.
-/// 2. Implement your trait for your type and add the attribute `#[archive_dyn]`
-///    to it. Make sure to implement your trait for your archived type as well.
-///    This invocation must have the same attributes as the trait invocation.
-/// 3. If deserialization support is desired, add `deserialize` or `deserialize
-///    = "..."` as parameters and implement `Deserialize` for the type. By
-///    default, the deserialize trait will be named "Deserialize" + your trait
-///    name. Passing a trait name will use that name instead.
-///
-/// Then you're ready to serialize boxed trait objects!
-///
-/// Even though your deserialized values are boxed as serialize trait objects,
-/// your archived values are boxed as regular trait objects. This is because
-/// your deserialized values have to implement `SerializeDyn` but your archived
-/// values do not.
-///
-/// # Examples
-///
-/// See [`archive_dyn`](macro@archive_dyn) for customization options.
-///
-/// ```
-/// use rkyv::{
-///     archived_value,
-///     ser::{serializers::AllocSerializer, Serializer},
-///     AlignedVec, Archive, Archived, Deserialize, Infallible, Serialize,
-/// };
-/// use rkyv_dyn::archive_dyn;
-///
-/// #[archive_dyn(deserialize)]
-/// trait ExampleTrait {
-///     fn value(&self) -> String;
-/// }
-///
-/// #[derive(Archive, Serialize, Deserialize)]
-/// struct StringStruct(String);
-///
-/// #[archive_dyn(deserialize)]
-/// impl ExampleTrait for StringStruct {
-///     fn value(&self) -> String {
-///         self.0.clone()
-///     }
-/// }
-///
-/// impl ExampleTrait for ArchivedStringStruct {
-///     fn value(&self) -> String {
-///         self.0.as_str().to_string()
-///     }
-/// }
-///
-/// #[derive(Archive, Serialize, Deserialize)]
-/// struct IntStruct(i32);
-///
-/// #[archive_dyn(deserialize)]
-/// impl ExampleTrait for IntStruct {
-///     fn value(&self) -> String {
-///         format!("{}", self.0)
-///     }
-/// }
-///
-/// impl ExampleTrait for ArchivedIntStruct {
-///     fn value(&self) -> String {
-///         format!("{}", self.0)
-///     }
-/// }
-///
-/// let boxed_int = Box::new(IntStruct(42)) as Box<dyn SerializeExampleTrait>;
-/// let boxed_string = Box::new(StringStruct("hello world".to_string()))
-///     as Box<dyn SerializeExampleTrait>;
-/// let mut serializer = AllocSerializer::<256>::default();
-/// let int_pos = serializer
-///     .serialize_value(&boxed_int)
-///     .expect("failed to archive boxed int");
-/// let str_pos = serializer
-///     .serialize_value(&boxed_string)
-///     .expect("failed to archive boxed string");
-/// let buf = serializer.into_serializer().into_inner();
-/// let archived_int = unsafe {
-///     archived_value::<Box<dyn SerializeExampleTrait>>(buf.as_ref(), int_pos)
-/// };
-/// let archived_string = unsafe {
-///     archived_value::<Box<dyn SerializeExampleTrait>>(buf.as_ref(), str_pos)
-/// };
-/// assert_eq!(archived_int.value(), "42");
-/// assert_eq!(archived_string.value(), "hello world");
-///
-/// let deserialized_int: Box<dyn SerializeExampleTrait> =
-///     archived_int.deserialize(&mut Infallible).unwrap();
-/// let deserialized_string: Box<dyn SerializeExampleTrait> =
-///     archived_string.deserialize(&mut Infallible).unwrap();
-/// assert_eq!(deserialized_int.value(), "42");
-/// assert_eq!(deserialized_string.value(), "hello world");
-/// ```
+/// This is implemented for every type that can be serialized with a
+/// [`DynSerializer`]. Traits generated by [`archive_dyn`](macro@archive_dyn)
+/// have it as a supertrait. See the [crate documentation](crate) for an
+/// example.
 // TODO: This is just `for<'a> SerializeUnsized<dyn DynSerializer<E>> + 'a`
 pub trait SerializeDyn<E> {
     /// Serializes this value and returns the position it is located at.
@@ -192,9 +165,9 @@ impl<E> Fallible for dyn DynDeserializer<E> + '_ {
 
 impl<D, E> DynDeserializer<E> for D where D: Pooling<E> {}
 
-/// TODO
+/// Converts a deserializer into a [`DynDeserializer`].
 pub trait AsDynDeserializer<E> {
-    /// TODO
+    /// Returns this deserializer as a [`DynDeserializer`] trait object.
     fn as_dyn_deserializer(&mut self) -> &mut dyn DynDeserializer<E>;
 }
 
@@ -239,11 +212,17 @@ pub struct ArchivedDynMetadata<T: ?Sized> {
 }
 
 // SAFETY: `ArchivedDynMetadata<T>` is a transparent wrapper around an archived
-// `ImplId`, so if that archived type is initialized then so is
+// `ImplId`, so if that archived type has no undefined bytes then neither does
 // `ArchivedDynMetadata<T>`.
-unsafe impl<T: ?Sized> Initialized for ArchivedDynMetadata<T> where
-    Archived<ImplId>: Initialized
+unsafe impl<T: ?Sized> NoUndef for ArchivedDynMetadata<T> where
+    Archived<ImplId>: NoUndef
 {
+}
+
+impl<T: ?Sized> Default for ArchivedDynMetadata<T> {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl<T: ?Sized> Copy for ArchivedDynMetadata<T> {}
@@ -252,11 +231,7 @@ unsafe impl<T: ?Sized> Sync for ArchivedDynMetadata<T> {}
 impl<T: ?Sized> Unpin for ArchivedDynMetadata<T> {}
 
 impl<T: ?Sized> ArchivedDynMetadata<T> {
-    /// Creates a new `ArchivedDynMetadata` for the given type.
-    ///
-    /// # Safety
-    ///
-    /// `out` must point to a valid location for an `ArchivedDynMetadata<T>`.
+    /// Creates a new `ArchivedDynMetadata` with the given impl ID.
     pub fn new(impl_id: ImplId) -> Self {
         Self {
             impl_id: Archived::<ImplId>::from_native(impl_id),
@@ -268,17 +243,26 @@ impl<T: ?Sized> ArchivedDynMetadata<T> {
     pub fn impl_id(&self) -> ImplId {
         self.impl_id.to_native()
     }
+}
 
+impl<T: ?Sized> ArchivedDynMetadata<T> {
     /// Returns the pointer metadata for the trait object this metadata refers
     /// to.
+    ///
+    /// The impl ID is trusted to be registered for the trait `T`. Validation
+    /// checks this, so archives accessed with `access` always satisfy it.
+    ///
+    /// # Panics
+    ///
+    /// - If [`register_trait_impls!`] has not been called.
+    /// - If the impl ID is not registered.
     pub fn lookup_metadata(&self) -> DynMetadata<T> {
-        unsafe {
-            TRAIT_IMPLS
-                .get()
-                .expect("TRAIT_IMPLS was not initialized for rkyv_dyn")
-                [self.impl_id() as usize]
-                .downcast_metadata()
-        }
+        let trait_impl = TraitImpl::find(self.impl_id())
+            .expect("impl ID was not registered with register_trait_impls!");
+        // SAFETY: Validation checks that the impl ID is registered for `T`, and
+        // accessing an archive without validation requires the caller to
+        // guarantee that it is valid.
+        unsafe { trait_impl.downcast_metadata() }
     }
 }
 
@@ -303,13 +287,13 @@ impl<T: ?Sized> PartialEq for ArchivedDynMetadata<T> {
 impl<T: ?Sized> Eq for ArchivedDynMetadata<T> {}
 
 impl<T: ?Sized> PartialOrd for ArchivedDynMetadata<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl<T: ?Sized> Ord for ArchivedDynMetadata<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.impl_id.cmp(&other.impl_id)
     }
 }
@@ -317,32 +301,67 @@ impl<T: ?Sized> Ord for ArchivedDynMetadata<T> {
 /// The trait object metadata for a trait implementation.
 #[derive(Clone, Copy, Debug)]
 pub struct TraitImpl {
+    impl_id: ImplId,
+    #[cfg_attr(not(feature = "bytecheck"), allow(dead_code))]
+    trait_type_id: TypeId,
     // The type of this `DynMetadata` is erased. Whatever uses it will
     // transmute it to the correct `DynMetadata<T>`.
     metadata: DynMetadata<()>,
+    #[cfg_attr(not(feature = "bytecheck"), allow(dead_code))]
+    check_bytes: CheckBytesDyn,
 }
 
-impl TraitImpl {
-    /// Creates a new trait impl from a trait object pointer.
-    ///
-    /// # Safety
-    ///
-    /// `pointer` must have valid metadata.
-    pub unsafe fn from_pointer<
-        T: Pointee<Metadata = DynMetadata<T>> + ?Sized,
-    >(
-        pointer: *const T,
-    ) -> Self {
-        Self::from_metadata(ptr_meta::metadata(pointer))
-    }
+#[cfg(feature = "bytecheck")]
+use validation::CheckBytesDyn;
+#[cfg(not(feature = "bytecheck"))]
+#[doc(hidden)]
+pub type CheckBytesDyn = ();
 
-    /// Creates a new trait impl from its trait object metadata.
-    pub fn from_metadata<T: ?Sized>(metadata: DynMetadata<T>) -> Self {
+impl TraitImpl {
+    /// Creates a new trait impl for the `dyn Trait` `T` from its impl ID and
+    /// trait object metadata.
+    ///
+    /// Use [`trait_impl!`] instead of calling this directly.
+    #[doc(hidden)]
+    pub fn new<T: ?Sized + 'static>(
+        impl_id: ImplId,
+        metadata: DynMetadata<T>,
+        check_bytes: CheckBytesDyn,
+    ) -> Self {
         Self {
+            impl_id,
+            trait_type_id: TypeId::of::<T>(),
             // SAFETY: All `DynMetadata<T>` have the same layout and validity.
             // They all contain a single erased `&'static VTable` reference and
             // a `PhantomData<T>`.
-            metadata: unsafe { core::mem::transmute(metadata) },
+            metadata: unsafe {
+                core::mem::transmute::<DynMetadata<T>, DynMetadata<()>>(
+                    metadata,
+                )
+            },
+            check_bytes,
+        }
+    }
+
+    /// Returns the impl ID of this trait implementation.
+    pub fn impl_id(&self) -> ImplId {
+        self.impl_id
+    }
+
+    /// Returns the registered trait impl with the given impl ID, or `None` if
+    /// it is not registered.
+    pub fn find(impl_id: ImplId) -> Option<&'static TraitImpl> {
+        let trait_impls = TRAIT_IMPLS.get()?;
+        // Impl IDs are assigned sequentially from 0 by default, so the impl
+        // is usually at the index matching its ID.
+        match trait_impls.get(impl_id as usize) {
+            Some(trait_impl) if trait_impl.impl_id == impl_id => {
+                Some(trait_impl)
+            }
+            _ => trait_impls
+                .binary_search_by_key(&impl_id, |trait_impl| trait_impl.impl_id)
+                .ok()
+                .map(|index| &trait_impls[index]),
         }
     }
 
@@ -359,49 +378,86 @@ impl TraitImpl {
 
 /// Creates a new [`TraitImpl`] from the given type and dyn trait.
 ///
-/// See [`register_trait_impls`] for a macro that registers these trait impls
-/// globally.
-///
-/// # Example
-/// ```
-/// struct MyType;
-///
-/// trait MyTrait {}
-///
-/// impl MyTrait for MyType {}
-///
-/// let trait_impl = trait_impl!(MyType as dyn MyTrait);
-/// ```
+/// The type must already implement [`RegisteredImpl`] for the trait. See
+/// [`register_trait_impls!`], which calls this for every impl it registers.
 #[macro_export]
 macro_rules! trait_impl {
     ($type:ty as $trait:ty) => {
-        // SAFETY: The given pointer is guaranteed to have valid metadata
-        // because we just made them.
-        unsafe {
-            $crate::TraitImpl::from_pointer(
+        $crate::TraitImpl::new::<$trait>(
+            <$type as $crate::RegisteredImpl<$trait>>::IMPL_ID,
+            $crate::__private::ptr_meta::metadata(
                 ::core::ptr::null::<$type>() as *const $trait
-            )
-        }
+            ),
+            $crate::__check_bytes_dyn!($type),
+        )
     };
 }
 
-/// All registered trait impls for `rkyv_dyn`.
+#[cfg(feature = "bytecheck")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __check_bytes_dyn {
+    ($type:ty) => {{
+        #[allow(unused_imports)]
+        use $crate::validation::{IsCheckBytesDyn, NotCheckBytesDyn};
+        IsCheckBytesDyn::<$type>::CHECK_BYTES_DYN
+    }};
+}
+
+#[cfg(not(feature = "bytecheck"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __check_bytes_dyn {
+    ($type:ty) => {
+        ()
+    };
+}
+
+#[doc(hidden)]
+pub mod __private {
+    pub use ptr_meta;
+}
+
+/// All registered trait impls for `rkyv_dyn`, sorted by impl ID.
 ///
-/// This can be initialized with
+/// This is initialized by [`register_trait_impls!`].
 pub static TRAIT_IMPLS: LazyStatic<&'static [TraitImpl]> = LazyStatic::new();
 
-/// Globally registers the given trait impls. This macro performs three basic
-/// functions:
+/// Globally registers the given trait impls.
 ///
-/// 1. Generating `impl RegisteredImpl<$trait> for $type` definitions with valid
-///    impl IDs.
+/// Call this exactly once in your program, before serializing or accessing any
+/// archived trait objects. Each entry is an archived type and the archived
+/// trait it implements, optionally followed by `= id` to choose its impl ID.
+/// Entries without an explicit ID get the ID of the previous entry plus one,
+/// starting at 0.
+///
+/// This macro performs three basic functions:
+///
+/// 1. Generating `impl RegisteredImpl<$trait> for $type` definitions with impl
+///    IDs. Duplicate impl IDs are a compile error.
 /// 2. Creating and initializing a static array of [`TraitImpl`]s, one for each
 ///    trait impl argument.
 /// 3. Initializing [`TRAIT_IMPLS`] with a reference to the array of
 ///    [`TraitImpl`]s.
+///
+/// # Panics
+///
+/// If called more than once.
+///
+/// # Example
+///
+/// ```ignore
+/// register_trait_impls! {
+///     Archived<Square> as dyn DeserializeShape<Error, Error> = 0,
+///     Archived<Circle> as dyn DeserializeShape<Error, Error> = 1,
+/// }
+/// ```
 #[macro_export]
 macro_rules! register_trait_impls {
     ($($type:ty as $trait:ty $(= $id:expr)?),* $(,)?) => {
+        // The impls are generated inside the calling function because the
+        // registration has to run at runtime.
+        #[allow(non_local_definitions)]
         let _: () = {
             $crate::register_trait_impls!(
                 @register $($type as $trait $(= $id)?,)*
@@ -412,12 +468,18 @@ macro_rules! register_trait_impls {
                 $crate::TraitImpl;
                 TRAIT_IMPL_COUNT
             ]> = $crate::LazyStatic::new();
-            let trait_impls = TRAIT_IMPLS.init([
+            let mut trait_impls = [
                 $(
                     $crate::trait_impl!($type as $trait),
                 )*
-            ]).unwrap();
-            $crate::TRAIT_IMPLS.init(trait_impls).unwrap();
+            ];
+            trait_impls.sort_unstable_by_key($crate::TraitImpl::impl_id);
+            let trait_impls = TRAIT_IMPLS.init(trait_impls).expect(
+                "register_trait_impls! was called more than once",
+            );
+            $crate::TRAIT_IMPLS.init(trait_impls).expect(
+                "register_trait_impls! was called more than once",
+            );
         };
     };
     (
@@ -439,9 +501,10 @@ macro_rules! register_trait_impls {
 
         $crate::register_trait_impls!(
             @register_rest $first_type as $first_trait,
-            $($rest_type:ty as $rest_trait:ty $(= $rest_id:expr)?,)*
+            $($rest_type as $rest_trait $(= $rest_id)?,)*
         );
     };
+    (@register) => {};
     (@register_rest $prev_type:ty as $prev_trait:ty,) => {};
     (
         @register_rest
