@@ -13,7 +13,7 @@ repository.workspace = true
 bytecheck = { workspace = true, optional = true }
 ptr_meta.workspace = true
 rkyv.workspace = true
-rkyv_dyn = { path = "../rkyv_dyn", default-features = false }
+rkyv_dyn = { package = "ezel-rkyv_dyn08", path = "../rkyv_dyn", default-features = false }
 
 [features]
 default = ["rkyv/std", "bytecheck"]

@@ -12,15 +12,13 @@
 //! 2. Implement your trait for your type and for its archived type. If you
 //!    passed `deserialize` to the trait, add `#[archive_dyn(deserialize)]` to
 //!    the impl for your type too.
-//! 3. Call [`register_trait_impls!`] once in your program, before serializing
-//!    or accessing any trait objects, and list every archived type with the
-//!    archived trait it implements.
+//! 3. Register every archived type with the archived trait it implements and
+//!    an impl ID with [`register_trait_impls!`]. This can be done in any crate,
+//!    including crates other than the ones that define the trait and the type.
 //!
-//! Every archived trait object stores the impl ID of its type. Impl IDs are
-//! assigned in the order the impls are listed in [`register_trait_impls!`],
-//! so reordering the list changes them and breaks existing archives. Give each
-//! impl an explicit ID with `= id` if archives need to outlive the program
-//! that wrote them.
+//! Every archived trait object stores the impl ID of its type. Each impl of a
+//! trait needs a different ID, and an impl must keep its ID for as long as
+//! archives written with it are read.
 //!
 //! # Example
 //!
@@ -49,14 +47,14 @@
 //!     }
 //! }
 //!
+//! register_trait_impls! {
+//!     Archived<Square> as dyn DeserializeShape<Error, Error> = 0,
+//! }
+//!
 //! type BoxedShape = Box<dyn SerializeShape<Error, Error>>;
 //!
 //! # #[cfg(feature = "bytecheck")]
 //! fn main() {
-//!     register_trait_impls! {
-//!         Archived<Square> as dyn DeserializeShape<Error, Error> = 0,
-//!     }
-//!
 //!     let value: BoxedShape = Box::new(Square(2.0));
 //!     let bytes = rkyv::to_bytes::<Error>(&value).unwrap();
 //!
@@ -80,13 +78,17 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::missing_crate_level_docs)]
 
-mod lazy_static;
 #[cfg(feature = "bytecheck")]
 pub mod validation;
 
-use core::{any::TypeId, hash, marker::PhantomData};
+use core::{
+    any::{type_name, TypeId},
+    error::Error,
+    fmt, hash,
+    marker::PhantomData,
+};
+use std::sync::OnceLock;
 
-pub use lazy_static::LazyStatic;
 use ptr_meta::{DynMetadata, Pointee};
 use rancor::Fallible;
 use rkyv::{
@@ -245,7 +247,7 @@ impl<T: ?Sized> ArchivedDynMetadata<T> {
     }
 }
 
-impl<T: ?Sized> ArchivedDynMetadata<T> {
+impl<T: ?Sized + 'static> ArchivedDynMetadata<T> {
     /// Returns the pointer metadata for the trait object this metadata refers
     /// to.
     ///
@@ -254,10 +256,9 @@ impl<T: ?Sized> ArchivedDynMetadata<T> {
     ///
     /// # Panics
     ///
-    /// - If [`register_trait_impls!`] has not been called.
-    /// - If the impl ID is not registered.
+    /// If the impl ID is not registered for `T`.
     pub fn lookup_metadata(&self) -> DynMetadata<T> {
-        let trait_impl = TraitImpl::find(self.impl_id())
+        let trait_impl = TraitImpl::find::<T>(self.impl_id())
             .expect("impl ID was not registered with register_trait_impls!");
         // SAFETY: Validation checks that the impl ID is registered for `T`, and
         // accessing an archive without validation requires the caller to
@@ -302,7 +303,8 @@ impl<T: ?Sized> Ord for ArchivedDynMetadata<T> {
 #[derive(Clone, Copy, Debug)]
 pub struct TraitImpl {
     impl_id: ImplId,
-    #[cfg_attr(not(feature = "bytecheck"), allow(dead_code))]
+    type_id: TypeId,
+    type_name: &'static str,
     trait_type_id: TypeId,
     // The type of this `DynMetadata` is erased. Whatever uses it will
     // transmute it to the correct `DynMetadata<T>`.
@@ -318,18 +320,20 @@ use validation::CheckBytesDyn;
 pub type CheckBytesDyn = ();
 
 impl TraitImpl {
-    /// Creates a new trait impl for the `dyn Trait` `T` from its impl ID and
-    /// trait object metadata.
+    /// Creates a new trait impl of the `dyn Trait` `T` for the archived type
+    /// `A` from its impl ID and trait object metadata.
     ///
     /// Use [`trait_impl!`] instead of calling this directly.
     #[doc(hidden)]
-    pub fn new<T: ?Sized + 'static>(
+    pub fn new<A: 'static, T: ?Sized + 'static>(
         impl_id: ImplId,
         metadata: DynMetadata<T>,
         check_bytes: CheckBytesDyn,
     ) -> Self {
         Self {
             impl_id,
+            type_id: TypeId::of::<A>(),
+            type_name: type_name::<A>(),
             trait_type_id: TypeId::of::<T>(),
             // SAFETY: All `DynMetadata<T>` have the same layout and validity.
             // They all contain a single erased `&'static VTable` reference and
@@ -348,21 +352,34 @@ impl TraitImpl {
         self.impl_id
     }
 
-    /// Returns the registered trait impl with the given impl ID, or `None` if
-    /// it is not registered.
-    pub fn find(impl_id: ImplId) -> Option<&'static TraitImpl> {
-        let trait_impls = TRAIT_IMPLS.get()?;
-        // Impl IDs are assigned sequentially from 0 by default, so the impl
-        // is usually at the index matching its ID.
-        match trait_impls.get(impl_id as usize) {
-            Some(trait_impl) if trait_impl.impl_id == impl_id => {
-                Some(trait_impl)
-            }
-            _ => trait_impls
-                .binary_search_by_key(&impl_id, |trait_impl| trait_impl.impl_id)
-                .ok()
-                .map(|index| &trait_impls[index]),
-        }
+    /// Returns the impl of the `dyn Trait` `T` registered with the given impl
+    /// ID, or `None` if there is none.
+    pub fn find<T: ?Sized + 'static>(impl_id: ImplId) -> Option<&'static Self> {
+        let by_impl_id = &TraitImpls::get().by_impl_id;
+        let key = (TypeId::of::<T>(), impl_id);
+        by_impl_id
+            .binary_search_by_key(&key, |trait_impl| {
+                (trait_impl.trait_type_id, trait_impl.impl_id)
+            })
+            .ok()
+            .map(|index| &by_impl_id[index])
+    }
+
+    /// Returns the impl of the `dyn Trait` `T` registered for the archived
+    /// type `A`.
+    pub fn find_by_type<A: 'static, T: ?Sized + 'static>(
+    ) -> Result<&'static Self, UnregisteredImpl> {
+        let by_type = &TraitImpls::get().by_type;
+        let key = (TypeId::of::<T>(), TypeId::of::<A>());
+        by_type
+            .binary_search_by_key(&key, |trait_impl| {
+                (trait_impl.trait_type_id, trait_impl.type_id)
+            })
+            .map(|index| &by_type[index])
+            .map_err(|_| UnregisteredImpl {
+                type_name: type_name::<A>(),
+                trait_name: type_name::<T>(),
+            })
     }
 
     /// Returns the trait object metadata of this trait implementation downcast
@@ -376,15 +393,35 @@ impl TraitImpl {
     }
 }
 
-/// Creates a new [`TraitImpl`] from the given type and dyn trait.
+/// The error returned when serializing a trait object whose archived type is
+/// not registered with [`register_trait_impls!`].
+#[derive(Debug)]
+pub struct UnregisteredImpl {
+    type_name: &'static str,
+    trait_name: &'static str,
+}
+
+impl fmt::Display for UnregisteredImpl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is not registered as {} with register_trait_impls!",
+            self.type_name, self.trait_name,
+        )
+    }
+}
+
+impl Error for UnregisteredImpl {}
+
+/// Creates a new [`TraitImpl`] from the given type, dyn trait and impl ID.
 ///
-/// The type must already implement [`RegisteredImpl`] for the trait. See
-/// [`register_trait_impls!`], which calls this for every impl it registers.
+/// See [`register_trait_impls!`], which calls this for every impl it
+/// registers.
 #[macro_export]
 macro_rules! trait_impl {
-    ($type:ty as $trait:ty) => {
-        $crate::TraitImpl::new::<$trait>(
-            <$type as $crate::RegisteredImpl<$trait>>::IMPL_ID,
+    ($type:ty as $trait:ty = $id:expr) => {
+        $crate::TraitImpl::new::<$type, $trait>(
+            $id,
             $crate::__private::ptr_meta::metadata(
                 ::core::ptr::null::<$type>() as *const $trait
             ),
@@ -415,34 +452,106 @@ macro_rules! __check_bytes_dyn {
 
 #[doc(hidden)]
 pub mod __private {
+    pub use inventory;
     pub use ptr_meta;
 }
 
-/// All registered trait impls for `rkyv_dyn`, sorted by impl ID.
+/// A trait impl submitted by [`register_trait_impls!`].
 ///
-/// This is initialized by [`register_trait_impls!`].
-pub static TRAIT_IMPLS: LazyStatic<&'static [TraitImpl]> = LazyStatic::new();
+/// [`TraitImpl::new`] is not a `const fn`, so the trait impl is created when
+/// the registry is first used.
+#[doc(hidden)]
+pub struct TraitImplEntry(pub fn() -> TraitImpl);
 
-/// Globally registers the given trait impls.
+inventory::collect!(TraitImplEntry);
+
+/// All trait impls submitted by [`register_trait_impls!`].
+struct TraitImpls {
+    /// Sorted by trait and impl ID.
+    by_impl_id: Box<[TraitImpl]>,
+    /// Sorted by trait and archived type.
+    by_type: Box<[TraitImpl]>,
+}
+
+impl TraitImpls {
+    fn get() -> &'static Self {
+        static TRAIT_IMPLS: OnceLock<TraitImpls> = OnceLock::new();
+        TRAIT_IMPLS.get_or_init(Self::collect)
+    }
+
+    /// Collects the submitted trait impls.
+    ///
+    /// # Panics
+    ///
+    /// If two impls of the same trait have the same impl ID, or one archived
+    /// type is registered for the same trait with two impl IDs.
+    fn collect() -> Self {
+        let mut by_impl_id = inventory::iter::<TraitImplEntry>
+            .into_iter()
+            .map(|entry| (entry.0)())
+            .collect::<Vec<_>>();
+        by_impl_id.sort_unstable_by_key(|trait_impl| {
+            (
+                trait_impl.trait_type_id,
+                trait_impl.impl_id,
+                trait_impl.type_id,
+            )
+        });
+        // The same impl may be registered more than once.
+        by_impl_id.dedup_by_key(|trait_impl| {
+            (
+                trait_impl.trait_type_id,
+                trait_impl.impl_id,
+                trait_impl.type_id,
+            )
+        });
+        for pair in by_impl_id.windows(2) {
+            if (pair[0].trait_type_id, pair[0].impl_id)
+                == (pair[1].trait_type_id, pair[1].impl_id)
+            {
+                panic!(
+                    "impl ID {} is registered for both {} and {}",
+                    pair[0].impl_id, pair[0].type_name, pair[1].type_name,
+                );
+            }
+        }
+
+        let mut by_type = by_impl_id.clone();
+        by_type.sort_unstable_by_key(|trait_impl| {
+            (trait_impl.trait_type_id, trait_impl.type_id)
+        });
+        for pair in by_type.windows(2) {
+            if (pair[0].trait_type_id, pair[0].type_id)
+                == (pair[1].trait_type_id, pair[1].type_id)
+            {
+                panic!(
+                    "{} is registered with both impl ID {} and {}",
+                    pair[0].type_name, pair[0].impl_id, pair[1].impl_id,
+                );
+            }
+        }
+
+        Self {
+            by_impl_id: by_impl_id.into_boxed_slice(),
+            by_type: by_type.into_boxed_slice(),
+        }
+    }
+
+    #[cfg_attr(not(feature = "bytecheck"), allow(dead_code))]
+    fn iter() -> impl Iterator<Item = &'static TraitImpl> {
+        Self::get().by_impl_id.iter()
+    }
+}
+
+/// Registers trait impls.
 ///
-/// Call this exactly once in your program, before serializing or accessing any
-/// archived trait objects. Each entry is an archived type and the archived
-/// trait it implements, optionally followed by `= id` to choose its impl ID.
-/// Entries without an explicit ID get the ID of the previous entry plus one,
-/// starting at 0.
+/// Each entry is an archived type, the archived trait it implements and its
+/// impl ID. Impl IDs are stored in archives, so an impl must keep its ID for
+/// as long as archives written with it are read, and each impl of a trait
+/// needs a different ID.
 ///
-/// This macro performs three basic functions:
-///
-/// 1. Generating `impl RegisteredImpl<$trait> for $type` definitions with impl
-///    IDs. Duplicate impl IDs are a compile error.
-/// 2. Creating and initializing a static array of [`TraitImpl`]s, one for each
-///    trait impl argument.
-/// 3. Initializing [`TRAIT_IMPLS`] with a reference to the array of
-///    [`TraitImpl`]s.
-///
-/// # Panics
-///
-/// If called more than once.
+/// This can be called any number of times, in any crate. The impls are
+/// registered when the program starts, through [`inventory`].
 ///
 /// # Example
 ///
@@ -454,92 +563,13 @@ pub static TRAIT_IMPLS: LazyStatic<&'static [TraitImpl]> = LazyStatic::new();
 /// ```
 #[macro_export]
 macro_rules! register_trait_impls {
-    ($($type:ty as $trait:ty $(= $id:expr)?),* $(,)?) => {
-        // The impls are generated inside the calling function because the
-        // registration has to run at runtime.
-        #[allow(non_local_definitions)]
-        let _: () = {
-            $crate::register_trait_impls!(
-                @register $($type as $trait $(= $id)?,)*
-            );
-            const TRAIT_IMPL_COUNT: usize = 0
-                $(+ { let _ = ::core::marker::PhantomData::<$type>; 1 })*;
-            static TRAIT_IMPLS: $crate::LazyStatic<[
-                $crate::TraitImpl;
-                TRAIT_IMPL_COUNT
-            ]> = $crate::LazyStatic::new();
-            let mut trait_impls = [
-                $(
-                    $crate::trait_impl!($type as $trait),
-                )*
-            ];
-            trait_impls.sort_unstable_by_key($crate::TraitImpl::impl_id);
-            let trait_impls = TRAIT_IMPLS.init(trait_impls).expect(
-                "register_trait_impls! was called more than once",
-            );
-            $crate::TRAIT_IMPLS.init(trait_impls).expect(
-                "register_trait_impls! was called more than once",
-            );
-        };
+    ($($type:ty as $trait:ty = $id:expr),* $(,)?) => {
+        $(
+            $crate::__private::inventory::submit! {
+                $crate::TraitImplEntry(
+                    || $crate::trait_impl!($type as $trait = $id)
+                )
+            }
+        )*
     };
-    (
-        @register
-        $first_type:ty as $first_trait:ty $(= $first_id:expr)?,
-        $($rest_type:ty as $rest_trait:ty $(= $rest_id:expr)?,)*
-    ) => {
-        struct ImplIds;
-
-        trait Registered<const ID: $crate::ImplId> {}
-
-        unsafe impl $crate::RegisteredImpl<$first_trait> for $first_type {
-            const IMPL_ID: $crate::ImplId =
-                $crate::register_trait_impls!(@choose_id 0, $($first_id)?);
-        }
-        impl Registered<
-            { <$first_type as $crate::RegisteredImpl<$first_trait>>::IMPL_ID }
-        > for ImplIds {}
-
-        $crate::register_trait_impls!(
-            @register_rest $first_type as $first_trait,
-            $($rest_type as $rest_trait $(= $rest_id)?,)*
-        );
-    };
-    (@register) => {};
-    (@register_rest $prev_type:ty as $prev_trait:ty,) => {};
-    (
-        @register_rest
-        $prev_type:ty as $prev_trait:ty,
-        $type:ty as $trait:ty $(= $id:expr)?,
-        $($rest_type:ty as $rest_trait:ty $(= $rest_id:expr)?,)*
-    ) => {
-        unsafe impl $crate::RegisteredImpl<$trait> for $type {
-            const IMPL_ID: $crate::ImplId = $crate::register_trait_impls!(
-                @choose_id
-                <
-                    $prev_type as $crate::RegisteredImpl<$prev_trait>
-                >::IMPL_ID + 1,
-                $($id)?
-            );
-        }
-        impl Registered<{
-            <$type as $crate::RegisteredImpl<$trait>>::IMPL_ID
-        }> for ImplIds {}
-
-        $crate::register_trait_impls!(
-            @register_rest $type as $trait,
-            $($rest_type as $rest_trait $(= $rest_id)?,)*
-        );
-    };
-    (@choose_id $default:expr, $explicit:expr) => { $explicit };
-    (@choose_id $default:expr,) => { $default };
-}
-
-/// A trait impl that has a globally-unique ID.
-///
-/// # Safety
-///
-/// `IMPL_ID` must be globally unique.
-pub unsafe trait RegisteredImpl<T: ?Sized> {
-    /// The ID of this trait impl.
-    const IMPL_ID: ImplId;
 }

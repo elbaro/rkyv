@@ -23,6 +23,7 @@ repository = "https://github.com/rkyv/rkyv"
 bytecheck = { version = "0.8", default-features = false, features = ["simdutf8"] }
 divan = { version = "0.1", default-features = false }
 hashbrown = { version = "0.17", default-features = false }
+inventory = { version = "0.3", default-features = false }
 munge = { version = "0.4", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
 ptr_meta = { version = "0.3", default-features = false }
@@ -31,8 +32,8 @@ rend = { version = "0.5", default-features = false }
 rancor = { version = "0.1", default-features = false }
 rkyv = { version = "=0.8.18", default-features = false, path = "rkyv" }
 rkyv_derive = { version = "=0.8.18", default-features = false, path = "rkyv_derive" }
-rkyv_dyn = { version = "=0.8.18", default-features = false, path = "rkyv_dyn" }
-rkyv_dyn_derive = { version = "=0.8.18", default-features = false, path = "rkyv_dyn_derive" }
+rkyv_dyn = { package = "ezel-rkyv_dyn08", version = "=0.8.18", default-features = false, path = "rkyv_dyn" }
+rkyv_dyn_derive = { package = "ezel-rkyv_dyn_derive08", version = "=0.8.18", default-features = false, path = "rkyv_dyn_derive" }
 rustversion = { version = "1", default-features = false }
 syn = { version = "3.0", default-features = false }
 trybuild = { version = "1", default-features = false }

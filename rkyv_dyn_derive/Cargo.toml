@@ -1,5 +1,5 @@
 [package]
-name = "rkyv_dyn_derive"
+name = "ezel-rkyv_dyn_derive08"
 description = "Macros for rkyv_dyn"
 version.workspace = true
 edition.workspace = true
@@ -10,6 +10,7 @@ repository.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
+name = "rkyv_dyn_derive"
 proc-macro = true
 
 [dependencies]

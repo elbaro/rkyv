@@ -5,7 +5,7 @@ fn manual_archive_dyn() {
     use ptr_meta::{DynMetadata, Pointee};
     use rkyv::{
         access_unchecked, deserialize,
-        rancor::{Error, Fallible},
+        rancor::{Error, Fallible, Source},
         to_bytes,
         traits::{ArchivePointee, LayoutRaw},
         Archive, ArchiveUnsized, Archived, ArchivedMetadata, Deserialize,
@@ -14,7 +14,7 @@ fn manual_archive_dyn() {
     use rkyv_dyn::{
         register_trait_impls, ArchivedDynMetadata, AsDynDeserializer,
         AsDynSerializer, DeserializeDyn, DynDeserializer, DynSerializer,
-        ImplId, RegisteredImpl, SerializeDyn,
+        ImplId, SerializeDyn, TraitImpl, UnregisteredImpl,
     };
 
     pub trait Id {
@@ -23,24 +23,25 @@ fn manual_archive_dyn() {
 
     #[ptr_meta::pointee]
     pub trait SerializeId<SE, DE>: Id + SerializeDyn<SE> {
-        fn archived_impl_id(&self) -> ImplId;
+        fn archived_impl_id(&self) -> Result<ImplId, UnregisteredImpl>;
     }
 
-    impl<T, SE, DE> SerializeId<SE, DE> for T
+    impl<T, SE: 'static, DE: 'static> SerializeId<SE, DE> for T
     where
         T: Id + for<'a> Serialize<dyn DynSerializer<SE> + 'a>,
-        T::Archived: RegisteredImpl<dyn DeserializeId<SE, DE>>,
+        T::Archived: 'static,
     {
-        fn archived_impl_id(&self) -> ImplId {
-            T::Archived::IMPL_ID
+        fn archived_impl_id(&self) -> Result<ImplId, UnregisteredImpl> {
+            TraitImpl::find_by_type::<T::Archived, dyn DeserializeId<SE, DE>>()
+                .map(TraitImpl::impl_id)
         }
     }
 
-    impl<SE, DE> ArchiveUnsized for dyn SerializeId<SE, DE> {
+    impl<SE: 'static, DE: 'static> ArchiveUnsized for dyn SerializeId<SE, DE> {
         type Archived = dyn DeserializeId<SE, DE>;
 
         fn archived_metadata(&self) -> ArchivedMetadata<Self> {
-            ArchivedDynMetadata::new(self.archived_impl_id())
+            ArchivedDynMetadata::new(self.archived_impl_id().unwrap())
         }
     }
 
@@ -55,11 +56,14 @@ fn manual_archive_dyn() {
     impl<S, DE> SerializeUnsized<S> for dyn SerializeId<S::Error, DE>
     where
         S: Fallible + AsDynSerializer<S::Error> + ?Sized,
+        S::Error: Source,
+        DE: 'static,
     {
         fn serialize_unsized(
             &self,
             serializer: &mut S,
         ) -> Result<usize, S::Error> {
+            self.archived_impl_id().map_err(S::Error::new)?;
             self.serialize_dyn(serializer.as_dyn_serializer())
         }
     }
@@ -70,7 +74,7 @@ fn manual_archive_dyn() {
     {
     }
 
-    impl<SE, DE> ArchivePointee for dyn DeserializeId<SE, DE> {
+    impl<SE: 'static, DE: 'static> ArchivePointee for dyn DeserializeId<SE, DE> {
         type ArchivedMetadata = ArchivedDynMetadata<Self>;
 
         fn pointer_metadata(
@@ -89,6 +93,8 @@ fn manual_archive_dyn() {
         for dyn DeserializeId<SE, D::Error>
     where
         D: Fallible + AsDynDeserializer<D::Error> + ?Sized,
+        SE: 'static,
+        D::Error: 'static,
     {
         unsafe fn deserialize_unsized(
             &self,
@@ -118,15 +124,14 @@ fn manual_archive_dyn() {
     }
 
     register_trait_impls! {
-        Archived<Test> as dyn DeserializeId<Error, Error>,
+        Archived<Test> as dyn DeserializeId<Error, Error> = 0,
     }
 
     // Hack to make rustfmt happy
     type SId<SE, DE> = dyn SerializeId<SE, DE>;
-    impl<SE, DE> DeserializeDyn<SId<SE, DE>, DE> for ArchivedTest
+    impl<SE: 'static, DE: 'static> DeserializeDyn<SId<SE, DE>, DE> for ArchivedTest
     where
         Archived<Test>: for<'a> Deserialize<Test, dyn DynDeserializer<DE> + 'a>,
-        Archived<Test>: RegisteredImpl<dyn DeserializeId<SE, DE>>,
     {
         fn deserialize_dyn(
             &self,

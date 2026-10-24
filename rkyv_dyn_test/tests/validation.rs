@@ -2,13 +2,13 @@
 
 #![cfg(feature = "bytecheck")]
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use rkyv::{
     access, munge::munge, rancor::Error, to_bytes, Archive, Archived, Place,
     Portable, Serialize,
 };
-use rkyv_dyn::{archive_dyn, register_trait_impls, RegisteredImpl};
+use rkyv_dyn::{archive_dyn, register_trait_impls};
 
 // ─── Traits ──────────────────────────────────────────────────────────────────
 
@@ -107,16 +107,14 @@ impl Other for ArchivedUnit {}
 
 // ─── Registration ────────────────────────────────────────────────────────────
 
-fn register() {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        register_trait_impls! {
-            Archived<IntId> as dyn DeserializeId<Error, Error>,
-            Archived<Flag> as dyn DeserializeId<Error, Error>,
-            Archived<Unchecked> as dyn DeserializeId<Error, Error>,
-            Archived<Unit> as dyn ArchivedOther,
-        }
-    });
+const FLAG_ID: rkyv_dyn::ImplId = 1;
+const UNIT_ID: rkyv_dyn::ImplId = 3;
+
+register_trait_impls! {
+    Archived<IntId> as dyn DeserializeId<Error, Error> = 0,
+    Archived<Flag> as dyn DeserializeId<Error, Error> = FLAG_ID,
+    Archived<Unchecked> as dyn DeserializeId<Error, Error> = 2,
+    Archived<Unit> as dyn ArchivedOther = UNIT_ID,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -162,8 +160,6 @@ fn assert_access_error(bytes: &[u8], message: &str) {
 
 #[test]
 fn valid() {
-    register();
-
     let value: BoxedId = Box::new(IntId(42));
     let bytes = to_bytes::<Error>(&value).unwrap();
     let archived = access::<Archived<BoxedId>, Error>(&bytes).unwrap();
@@ -172,8 +168,6 @@ fn valid() {
 
 #[test]
 fn valid_shared() {
-    register();
-
     let shared: Arc<dyn SerializeId<Error, Error>> = Arc::new(IntId(3));
     let value = vec![shared.clone(), shared];
     let bytes = to_bytes::<Error>(&value).unwrap();
@@ -185,8 +179,6 @@ fn valid_shared() {
 
 #[test]
 fn invalid_value() {
-    register();
-
     let value: BoxedId = Box::new(Flag(true));
     let mut bytes = to_bytes::<Error>(&value).unwrap();
     assert!(access::<Archived<BoxedId>, Error>(&bytes).is_ok());
@@ -199,8 +191,6 @@ fn invalid_value() {
 
 #[test]
 fn unchecked_type() {
-    register();
-
     let value: BoxedId = Box::new(Unchecked(42));
     let bytes = to_bytes::<Error>(&value).unwrap();
     assert_access_error(&bytes, "does not implement CheckBytes");
@@ -208,8 +198,6 @@ fn unchecked_type() {
 
 #[test]
 fn unregistered_impl_id() {
-    register();
-
     let value: BoxedId = Box::new(IntId(42));
     let mut bytes = to_bytes::<Error>(&value).unwrap();
     set_root_impl_id(&mut bytes, 1000);
@@ -218,27 +206,20 @@ fn unregistered_impl_id() {
 
 #[test]
 fn impl_id_of_other_trait() {
-    register();
-
+    // Impl IDs are per trait, so the impl ID of `Unit` is not registered for
+    // `DeserializeId`.
     let value: BoxedId = Box::new(IntId(42));
     let mut bytes = to_bytes::<Error>(&value).unwrap();
-    let other_id =
-        <Archived<Unit> as RegisteredImpl<dyn ArchivedOther>>::IMPL_ID;
-    set_root_impl_id(&mut bytes, other_id);
-    assert_access_error(&bytes, "is registered for a different trait");
+    set_root_impl_id(&mut bytes, UNIT_ID);
+    assert_access_error(&bytes, "impl ID 3 is not registered");
 }
 
 #[test]
 fn impl_id_of_other_type() {
-    register();
-
     // Swapping the impl ID checks the bytes of the `ArchivedIntId` as an
     // `ArchivedFlag`. Every byte of the ID is 42, which is not a valid `bool`.
     let value: BoxedId = Box::new(IntId(0x2a2a2a2a));
     let mut bytes = to_bytes::<Error>(&value).unwrap();
-    let flag_id = <Archived<Flag> as RegisteredImpl<
-        dyn DeserializeId<Error, Error>,
-    >>::IMPL_ID;
-    set_root_impl_id(&mut bytes, flag_id);
+    set_root_impl_id(&mut bytes, FLAG_ID);
     assert_access_error(&bytes, "bool set to invalid byte 42");
 }

@@ -13,7 +13,7 @@ use rkyv::{
     validation::{shared::ValidationState, ArchiveContext, SharedContext},
 };
 
-use crate::{ArchivedDynMetadata, ImplId, TraitImpl, TRAIT_IMPLS};
+use crate::{ArchivedDynMetadata, ImplId, TraitImpl, TraitImpls};
 
 /// An object-safe validation context.
 ///
@@ -251,26 +251,15 @@ unsafe fn check_bytes_dyn_unimplemented(
 }
 
 #[derive(Debug)]
-enum InvalidImplId {
-    NotRegistered(ImplId),
-    WrongTrait(ImplId),
-}
+struct UnregisteredImplId(ImplId);
 
-impl fmt::Display for InvalidImplId {
+impl fmt::Display for UnregisteredImplId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotRegistered(impl_id) => {
-                write!(f, "impl ID {impl_id} is not registered")
-            }
-            Self::WrongTrait(impl_id) => write!(
-                f,
-                "impl ID {impl_id} is registered for a different trait",
-            ),
-        }
+        write!(f, "impl ID {} is not registered", self.0)
     }
 }
 
-impl Error for InvalidImplId {}
+impl Error for UnregisteredImplId {}
 
 // SAFETY: `verify` only returns `Ok` if the impl ID is registered for `T`,
 // which is what `lookup_metadata` requires.
@@ -282,14 +271,9 @@ where
 {
     fn verify(&self, _: &mut C) -> Result<(), C::Error> {
         let impl_id = self.impl_id();
-        match TraitImpl::find(impl_id) {
-            Some(trait_impl)
-                if trait_impl.trait_type_id == TypeId::of::<T>() =>
-            {
-                Ok(())
-            }
-            Some(_) => fail!(InvalidImplId::WrongTrait(impl_id)),
-            None => fail!(InvalidImplId::NotRegistered(impl_id)),
+        match TraitImpl::find::<T>(impl_id) {
+            Some(_) => Ok(()),
+            None => fail!(UnregisteredImplId(impl_id)),
         }
     }
 }
@@ -329,11 +313,9 @@ where
         unsafe { core::mem::transmute(ptr_meta::metadata(value)) };
     // `lookup_metadata` returns the exact metadata that was registered, so the
     // vtable addresses compare equal.
-    let trait_impl = TRAIT_IMPLS.get().and_then(|trait_impls| {
-        trait_impls.iter().find(|trait_impl| {
-            trait_impl.trait_type_id == TypeId::of::<T>()
-                && trait_impl.metadata == metadata
-        })
+    let trait_impl = TraitImpls::iter().find(|trait_impl| {
+        trait_impl.trait_type_id == TypeId::of::<T>()
+            && trait_impl.metadata == metadata
     });
     let Some(trait_impl) = trait_impl else {
         fail!(UnregisteredMetadata);

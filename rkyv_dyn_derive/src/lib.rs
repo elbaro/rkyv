@@ -12,10 +12,9 @@ use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream, Result},
-    parse_macro_input, parse_quote,
-    spanned::Spanned,
-    Attribute, Error, GenericArgument, Ident, ItemImpl, ItemTrait, LitStr,
-    Path, PathArguments, Token, Visibility,
+    parse_macro_input, parse_quote, Attribute, Error, GenericArgument, Ident,
+    ItemImpl, ItemTrait, LitStr, Path, PathArguments, Token, Type, TypePath,
+    Visibility,
 };
 
 enum Input {
@@ -57,6 +56,7 @@ impl Parse for Input {
 struct Args {
     serialize: Option<LitStr>,
     deserialize: Option<Option<LitStr>>,
+    archived: Option<LitStr>,
 }
 
 impl Parse for Args {
@@ -64,10 +64,12 @@ impl Parse for Args {
         mod kw {
             syn::custom_keyword!(serialize);
             syn::custom_keyword!(deserialize);
+            syn::custom_keyword!(archived);
         }
 
         let mut serialize = None;
         let mut deserialize = None;
+        let mut archived = None;
 
         let mut needs_punct = false;
         while !input.is_empty() {
@@ -95,10 +97,18 @@ impl Parse for Args {
                 } else {
                     deserialize = Some(None);
                 }
+            } else if input.peek(kw::archived) {
+                if archived.is_some() {
+                    return Err(input.error("duplicate archived argument"));
+                }
+
+                input.parse::<kw::archived>()?;
+                input.parse::<Token![=]>()?;
+                archived = Some(input.parse::<LitStr>()?);
             } else {
                 return Err(input.error(
-                    "expected serialize = \"...\" or deserialize = \"...\" \
-                     parameters",
+                    "expected serialize = \"...\", deserialize = \"...\" or \
+                     archived = \"...\" parameters",
                 ));
             }
 
@@ -108,6 +118,7 @@ impl Parse for Args {
         Ok(Args {
             serialize,
             deserialize,
+            archived,
         })
     }
 }
@@ -152,11 +163,10 @@ impl Args {
 /// On an implementation `impl Trait for Type`, this generates
 /// `DeserializeDyn` for the archived type of `Type` when `deserialize` is
 /// passed, and does nothing otherwise. It must have the same arguments as the
-/// trait invocation.
+/// trait invocation, plus `archived` if needed.
 ///
-/// Implementations are not registered automatically. List every archived type
-/// with the archived trait it implements in a single `register_trait_impls!`
-/// call.
+/// Implementations are not registered automatically. Register every archived
+/// type with the archived trait it implements with `register_trait_impls!`.
 ///
 /// # Parameters
 ///
@@ -165,6 +175,9 @@ impl Args {
 /// - `deserialize`, `deserialize = "..."`: Adds deserialization support to the
 ///   archived trait. You can choose the name of the archived trait and by
 ///   default it will be named "Deserialize" + your trait name.
+/// - `archived = "..."`: On an impl, names the archived type of `Type`. By
+///   default it is "Archived" + the type name, which is what rkyv derives
+///   unless `#[rkyv(archived = ...)]` is given.
 #[proc_macro_attribute]
 pub fn archive_dyn(
     attr: proc_macro::TokenStream,
@@ -206,13 +219,14 @@ fn rename_path(
 }
 
 fn generate_impl(input: &ItemImpl, args: &Args) -> Result<TokenStream> {
-    let Some(deserialize) = &args.deserialize else {
+    if args.deserialize.is_none() {
         return Ok(quote! { #input });
-    };
+    }
     let (trait_, _) = input.trait_.as_ref().unwrap();
     let trait_name = &trait_.segments.last().unwrap().ident;
 
     let ty = &input.self_ty;
+    let archived = archived_type(ty, args)?;
     let se: Ident = parse_quote!(__SE);
     let de: Ident = parse_quote!(__DE);
     let error_args: [GenericArgument; 2] =
@@ -220,35 +234,34 @@ fn generate_impl(input: &ItemImpl, args: &Args) -> Result<TokenStream> {
 
     let ser_trait =
         rename_path(trait_, args.serialize_name(trait_name), &error_args);
-    let de_name = match deserialize {
-        Some(de_name) => Ident::new(&de_name.value(), de_name.span()),
-        None => Ident::new(&format!("Deserialize{trait_name}"), trait_.span()),
-    };
-    let de_trait = rename_path(trait_, de_name, &error_args);
 
     let mut generics = input.generics.clone();
     generics.params.push(parse_quote!(#se));
     generics.params.push(parse_quote!(#de));
     let where_clause = generics.make_where_clause();
     where_clause.predicates.push(parse_quote! {
-        ::rkyv::Archived<#ty>: for<'__a> ::rkyv::Deserialize<
+        #ty: ::rkyv::Archive<Archived = #archived>
+    });
+    where_clause.predicates.push(parse_quote! {
+        #archived: for<'__a> ::rkyv::Deserialize<
             #ty,
             dyn ::rkyv_dyn::DynDeserializer<#de> + '__a,
         >
-    });
-    where_clause.predicates.push(parse_quote! {
-        ::rkyv::Archived<#ty>: ::rkyv_dyn::RegisteredImpl<dyn #de_trait>
     });
     where_clause.predicates.push(parse_quote! {
         #ty: #ser_trait
     });
     let (impl_generics, _, where_clause) = generics.split_for_impl();
 
+    // The impl is for the archived type itself rather than `Archived<#ty>`.
+    // rustc considers an impl for an associated type in another crate to
+    // overlap with every impl of the same trait, so impls in different crates
+    // would conflict.
     Ok(quote! {
         #input
 
         impl #impl_generics ::rkyv_dyn::DeserializeDyn<dyn #ser_trait, #de>
-            for ::rkyv::Archived<#ty>
+            for #archived
         #where_clause
         {
             fn deserialize_dyn(
@@ -276,7 +289,36 @@ fn generate_impl(input: &ItemImpl, args: &Args) -> Result<TokenStream> {
     })
 }
 
+/// Returns the archived type of `ty`: the `archived` argument if it is given,
+/// and otherwise the default name that rkyv derives, "Archived" + the type
+/// name.
+fn archived_type(ty: &Type, args: &Args) -> Result<Type> {
+    if let Some(archived) = &args.archived {
+        return archived.parse();
+    }
+    let mut archived = ty.clone();
+    let Type::Path(TypePath {
+        qself: None, path, ..
+    }) = &mut archived
+    else {
+        return Err(Error::new_spanned(
+            ty,
+            "expected a type path, pass archived = \"...\" for other types",
+        ));
+    };
+    let last = path.segments.last_mut().unwrap();
+    last.ident =
+        Ident::new(&format!("Archived{}", last.ident), last.ident.span());
+    Ok(archived)
+}
+
 fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
+    if let Some(archived) = &args.archived {
+        return Err(Error::new_spanned(
+            archived,
+            "archived can only be passed to impls",
+        ));
+    }
     let vis = &input.vis;
     let name = &input.ident;
     let ser_trait = args.serialize_name(name);
@@ -329,6 +371,12 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
             quote! { #(#args_,)* __S::Error },
         )
     };
+    // The archived trait of `dyn #ser_trait<#ser_unsized_args>`.
+    let ser_unsized_ar_args = if args.deserialize.is_some() {
+        quote! { #(#args_,)* __S::Error, #de }
+    } else {
+        quote! { #(#args_,)* }
+    };
     let ser_params = quote! { #(#params,)* #error_params };
     let ser_args = quote! { #(#args_,)* #error_params };
     let ar_params = quote! { #(#params,)* #ar_error_params };
@@ -358,6 +406,7 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
                         __D: ::rkyv::rancor::Fallible
                             + ::rkyv_dyn::AsDynDeserializer<__D::Error>
                             + ?Sized,
+                        dyn #ar_trait<#(#args_,)* #se, __D::Error>: 'static,
                         #where_predicates
                     {
                         unsafe fn deserialize_unsized(
@@ -427,7 +476,12 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
         #where_clause
         {
             #[doc(hidden)]
-            fn archived_impl_id(&self) -> ::rkyv_dyn::ImplId;
+            fn archived_impl_id(
+                &self,
+            ) -> ::core::result::Result<
+                ::rkyv_dyn::ImplId,
+                ::rkyv_dyn::UnregisteredImpl,
+            >;
         }
 
         #[::rkyv::ptr_meta::pointee(crate = ::rkyv::ptr_meta)]
@@ -444,23 +498,28 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
                     + for<'__a> ::rkyv::Serialize<
                         dyn ::rkyv_dyn::DynSerializer<#se> + '__a
                     >,
-                __T::Archived: ::rkyv_dyn::RegisteredImpl<
-                    dyn #ar_trait<#ar_args>
-                >,
+                __T::Archived: 'static,
+                dyn #ar_trait<#ar_args>: 'static,
                 #where_predicates
             {
-                fn archived_impl_id(&self) -> ::rkyv_dyn::ImplId {
-                    <
-                        __T::Archived as ::rkyv_dyn::RegisteredImpl<
-                            dyn #ar_trait<#ar_args>
-                        >
-                    >::IMPL_ID
+                fn archived_impl_id(
+                    &self,
+                ) -> ::core::result::Result<
+                    ::rkyv_dyn::ImplId,
+                    ::rkyv_dyn::UnregisteredImpl,
+                > {
+                    ::rkyv_dyn::TraitImpl::find_by_type::<
+                        __T::Archived,
+                        dyn #ar_trait<#ar_args>,
+                    >()
+                    .map(::rkyv_dyn::TraitImpl::impl_id)
                 }
             }
 
             impl<#ser_params> ::rkyv::ArchiveUnsized
                 for dyn #ser_trait<#ser_args>
             where
+                dyn #ar_trait<#ar_args>: 'static,
                 #where_predicates
             {
                 type Archived = dyn #ar_trait<#ar_args>;
@@ -468,9 +527,12 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
                 fn archived_metadata(
                     &self,
                 ) -> ::rkyv::ArchivedMetadata<Self> {
-                    ::rkyv_dyn::ArchivedDynMetadata::new(
-                        self.archived_impl_id(),
-                    )
+                    // `serialize_unsized` fails if the impl is not
+                    // registered, so this only panics if it was not called.
+                    let impl_id = self
+                        .archived_impl_id()
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    ::rkyv_dyn::ArchivedDynMetadata::new(impl_id)
                 }
             }
 
@@ -497,12 +559,16 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
                 __S: ::rkyv::rancor::Fallible
                     + ::rkyv_dyn::AsDynSerializer<__S::Error>
                     + ?Sized,
+                __S::Error: ::rkyv::rancor::Source,
+                dyn #ar_trait<#ser_unsized_ar_args>: 'static,
                 #where_predicates
             {
                 fn serialize_unsized(
                     &self,
                     serializer: &mut __S,
                 ) -> ::core::result::Result<usize, __S::Error> {
+                    self.archived_impl_id()
+                        .map_err(<__S::Error as ::rkyv::rancor::Source>::new)?;
                     self.serialize_dyn(serializer.as_dyn_serializer())
                 }
             }
@@ -510,6 +576,7 @@ fn generate_traits(input: &ItemTrait, args: &Args) -> Result<TokenStream> {
             impl<#ar_params> ::rkyv::traits::ArchivePointee
                 for dyn #ar_trait<#ar_args>
             where
+                dyn #ar_trait<#ar_args>: 'static,
                 #where_predicates
             {
                 type ArchivedMetadata =

@@ -1,9 +1,6 @@
 //! Trait objects archived with `archive_dyn`.
 
-use std::{
-    rc::Rc,
-    sync::{Arc, Once},
-};
+use std::{rc::Rc, sync::Arc};
 
 use rkyv::{
     access_unchecked, access_unchecked_mut, deserialize, rancor::Error,
@@ -133,17 +130,12 @@ pub struct Container {
 
 // ─── Registration ────────────────────────────────────────────────────────────
 
-fn register() {
-    static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        register_trait_impls! {
-            Archived<IntId> as dyn DeserializeId<Error, Error>,
-            Archived<NamedId> as dyn DeserializeId<Error, Error>,
-            Archived<Test<i32>> as dyn DTestTrait<i32, Error, Error>,
-            Archived<Test<String>> as dyn DTestTrait<String, Error, Error>,
-            Archived<Count> as dyn ArchivedCounter,
-        }
-    });
+register_trait_impls! {
+    Archived<IntId> as dyn DeserializeId<Error, Error> = 0,
+    Archived<NamedId> as dyn DeserializeId<Error, Error> = 1,
+    Archived<Test<i32>> as dyn DTestTrait<i32, Error, Error> = 0,
+    Archived<Test<String>> as dyn DTestTrait<String, Error, Error> = 0,
+    Archived<Count> as dyn ArchivedCounter = 0,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -152,8 +144,6 @@ type BoxedId = Box<dyn SerializeId<Error, Error>>;
 
 #[test]
 fn boxed() {
-    register();
-
     for value in [
         Box::new(IntId(42)) as BoxedId,
         Box::new(NamedId {
@@ -172,8 +162,6 @@ fn boxed() {
 
 #[test]
 fn custom_names_and_generic_trait() {
-    register();
-
     let int_value: Box<dyn STestTrait<i32, Error, Error>> =
         Box::new(Test { value: 42 });
     let string_value: Box<dyn STestTrait<String, Error, Error>> =
@@ -206,8 +194,6 @@ fn custom_names_and_generic_trait() {
 
 #[test]
 fn without_deserialize() {
-    register();
-
     let value: Box<dyn SerializeCounter<Error>> = Box::new(Count(10));
     let bytes = to_bytes::<Error>(&value).unwrap();
     let archived = unsafe {
@@ -218,8 +204,6 @@ fn without_deserialize() {
 
 #[test]
 fn mutable() {
-    register();
-
     let value: Box<dyn SerializeCounter<Error>> = Box::new(Count(10));
     let mut bytes = to_bytes::<Error>(&value).unwrap();
     let archived = unsafe {
@@ -239,8 +223,6 @@ fn mutable() {
 
 #[test]
 fn arc() {
-    register();
-
     let value: Arc<dyn SerializeId<Error, Error>> = Arc::new(IntId(42));
     let bytes = to_bytes::<Error>(&value).unwrap();
     let archived = unsafe {
@@ -255,8 +237,6 @@ fn arc() {
 
 #[test]
 fn rc() {
-    register();
-
     let value: Rc<dyn SerializeId<Error, Error>> = Rc::new(NamedId {
         name: "rc".to_string(),
         id: 1,
@@ -274,8 +254,6 @@ fn rc() {
 
 #[test]
 fn weak_access() {
-    register();
-
     let strong: Arc<dyn SerializeId<Error, Error>> = Arc::new(IntId(7));
     let value = (strong.clone(), Arc::downgrade(&strong));
     let bytes = to_bytes::<Error>(&value).unwrap();
@@ -292,8 +270,6 @@ fn weak_access() {
 
 #[test]
 fn container() {
-    register();
-
     let shared: Arc<dyn SerializeId<Error, Error>> = Arc::new(IntId(5));
     let value = Container {
         boxed: Box::new(IntId(1)),
@@ -342,8 +318,6 @@ fn container() {
 
 #[test]
 fn none() {
-    register();
-
     let value: Option<BoxedId> = None;
     let bytes = to_bytes::<Error>(&value).unwrap();
     let archived =

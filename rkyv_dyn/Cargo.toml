@@ -1,5 +1,5 @@
 [package]
-name = "rkyv_dyn"
+name = "ezel-rkyv_dyn08"
 description = "Trait object support for rkyv"
 keywords = ["archive", "rkyv", "serialization", "zero-copy", "no_std"]
 categories = ["encoding", "no-std"]
@@ -13,8 +13,12 @@ repository.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "rkyv_dyn"
+
 [dependencies]
 bytecheck = { workspace = true, optional = true }
+inventory.workspace = true
 ptr_meta.workspace = true
 rancor.workspace = true
 rkyv.workspace = true

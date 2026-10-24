@@ -1,12 +1,10 @@
-//! Explicit impl IDs in `register_trait_impls!`.
+//! Impl IDs given to `register_trait_impls!`.
 
 use rkyv::{
     access_unchecked, deserialize, rancor::Error, to_bytes, Archive, Archived,
     Deserialize, Serialize,
 };
-use rkyv_dyn::{
-    archive_dyn, register_trait_impls, ImplId, RegisteredImpl, TraitImpl,
-};
+use rkyv_dyn::{archive_dyn, register_trait_impls, ImplId, TraitImpl};
 
 #[archive_dyn(deserialize)]
 pub trait Id {
@@ -38,27 +36,30 @@ id_type!(B, ArchivedB, 2);
 id_type!(C, ArchivedC, 3);
 
 type BoxedId = Box<dyn SerializeId<Error, Error>>;
+type Trait = dyn DeserializeId<Error, Error>;
 
-fn impl_id<T: RegisteredImpl<dyn DeserializeId<Error, Error>>>() -> ImplId {
-    T::IMPL_ID
+register_trait_impls! {
+    Archived<A> as dyn DeserializeId<Error, Error> = 7,
+    Archived<B> as dyn DeserializeId<Error, Error> = 8,
+    Archived<C> as dyn DeserializeId<Error, Error> = 2,
+}
+
+fn impl_id<T: 'static>() -> ImplId {
+    TraitImpl::find_by_type::<T, Trait>().unwrap().impl_id()
 }
 
 #[test]
 fn explicit_impl_ids() {
-    // IDs are not in list order and do not match list positions.
-    register_trait_impls! {
-        Archived<A> as dyn DeserializeId<Error, Error> = 7,
-        Archived<B> as dyn DeserializeId<Error, Error>,
-        Archived<C> as dyn DeserializeId<Error, Error> = 2,
-    }
-
     assert_eq!(impl_id::<Archived<A>>(), 7);
     assert_eq!(impl_id::<Archived<B>>(), 8);
     assert_eq!(impl_id::<Archived<C>>(), 2);
     for impl_id in [2, 7, 8] {
-        assert_eq!(TraitImpl::find(impl_id).unwrap().impl_id(), impl_id);
+        assert_eq!(
+            TraitImpl::find::<Trait>(impl_id).unwrap().impl_id(),
+            impl_id
+        );
     }
-    assert!(TraitImpl::find(0).is_none());
+    assert!(TraitImpl::find::<Trait>(0).is_none());
 
     for (value, id) in [
         (Box::new(A) as BoxedId, 1),
